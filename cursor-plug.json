@@ -1,0 +1,15 @@
+{
+    "name": "test-mcp",
+    "version": "0.1.0",
+    "description": "Test MCP Server",
+    "transport": {
+        "type": "sse",
+        "endpoint": "/sse"
+    },
+    "capabilities": {
+        "tools": {
+            "list": true,
+            "call": true
+        }
+    }
+}
