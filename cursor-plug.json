@@ -1,7 +1,7 @@
 {
-    "name": "test-mcp",
+    "name": "domain-mcp",
     "version": "0.1.0",
-    "description": "Test MCP Server",
+    "description": "Domain MCP Server - Search, analyze, and monitor domains",
     "transport": {
         "type": "sse",
         "endpoint": "/sse"
