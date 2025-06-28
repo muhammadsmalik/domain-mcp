@@ -102,64 +102,219 @@ async def check_domain_availability(domain: str) -> bool:
         return True  # If DNS fails completely, might be available
 
 async def ssl_certificate_info(domain: str) -> Dict[str, Any]:
-    """Get SSL certificate information using crt.sh"""
-    async with httpx.AsyncClient() as client:
-        try:
-            resp = await client.get(f'https://crt.sh/?q={domain}&output=json')
-            if resp.status_code == 200:
-                certs = resp.json()
-                if certs:
-                    # Get the most recent certificate
-                    latest_cert = max(certs, key=lambda x: x.get('id', 0))
-                    return {
-                        'issuer': latest_cert.get('issuer_name', 'Unknown'),
-                        'not_before': latest_cert.get('not_before', 'Unknown'),
-                        'not_after': latest_cert.get('not_after', 'Unknown'),
-                        'common_name': latest_cert.get('common_name', 'Unknown'),
-                        'name_value': latest_cert.get('name_value', 'Unknown'),
-                    }
-            return {"error": "No SSL certificates found"}
-        except Exception as e:
-            return {"error": f"SSL lookup failed: {str(e)}"}
+    """Get SSL certificate information using socket connection"""
+    import ssl
+    import certifi
+    from datetime import datetime
+    
+    try:
+        # Create SSL context
+        context = ssl.create_default_context(cafile=certifi.where())
+        
+        # Connect to the domain on port 443
+        with socket.create_connection((domain, 443), timeout=10) as sock:
+            with context.wrap_socket(sock, server_hostname=domain) as ssock:
+                # Get certificate info
+                cert = ssock.getpeercert()
+                
+                # Parse certificate details
+                subject = dict(x[0] for x in cert['subject'])
+                issuer = dict(x[0] for x in cert['issuer'])
+                
+                # Convert dates
+                not_before = datetime.strptime(cert['notBefore'], '%b %d %H:%M:%S %Y %Z')
+                not_after = datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
+                
+                # Calculate days until expiration
+                days_until_expiry = (not_after - datetime.now()).days
+                
+                # Get SANs
+                san_list = []
+                for ext in cert.get('subjectAltName', []):
+                    if ext[0] == 'DNS':
+                        san_list.append(ext[1])
+                
+                return {
+                    'domain': domain,
+                    'common_name': subject.get('commonName', 'Unknown'),
+                    'issuer': issuer.get('organizationName', 'Unknown'),
+                    'issuer_cn': issuer.get('commonName', 'Unknown'),
+                    'not_before': not_before.isoformat(),
+                    'not_after': not_after.isoformat(),
+                    'days_until_expiry': days_until_expiry,
+                    'is_expired': days_until_expiry < 0,
+                    'is_expiring_soon': 0 <= days_until_expiry <= 30,
+                    'serial_number': cert.get('serialNumber', 'Unknown'),
+                    'version': cert.get('version', 'Unknown'),
+                    'subject_alt_names': san_list,
+                    'signature_algorithm': cert.get('signatureAlgorithm', 'Unknown')
+                }
+                
+    except socket.timeout:
+        return {"error": f"Connection timeout for {domain}"}
+    except socket.gaierror:
+        return {"error": f"Domain {domain} not found"}
+    except ssl.SSLError as e:
+        return {"error": f"SSL error: {str(e)}"}
+    except ConnectionRefusedError:
+        return {"error": f"Connection refused to {domain}:443"}
+    except Exception as e:
+        return {"error": f"SSL lookup failed: {str(e)}"}
 
 async def search_expired_domains(keyword: str = "", tld: str = "") -> List[Dict[str, str]]:
-    """Search for expired/expiring domains"""
-    async with httpx.AsyncClient() as client:
+    """Search for expired/expiring domains using multiple free APIs"""
+    domains = []
+    
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        # Method 1: DomainsDB API - Primary source for expired domains
         try:
-            # Using ExpiredDomains.net public data
-            url = "https://www.expireddomains.net/deleted-domains/"
+            params = {
+                'isDead': 'true',
+                'limit': 50
+            }
             if keyword:
-                url = f"https://www.expireddomains.net/domain-name-search/?q={keyword}"
+                params['domain'] = keyword
+            if tld:
+                params['zone'] = tld
                 
-            resp = await client.get(url, headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            })
+            resp = await client.get(
+                'https://api.domainsdb.info/v1/domains/search',
+                params=params
+            )
             
             if resp.status_code == 200:
-                soup = BeautifulSoup(resp.text, 'html.parser')
-                domains = []
-                
-                # Parse the table of domains
-                table = soup.find('table', class_='base1')
-                if table:
-                    rows = table.find_all('tr')[1:11]  # Get first 10 results
-                    for row in rows:
-                        cells = row.find_all('td')
-                        if len(cells) > 1:
-                            domain_cell = cells[0]
-                            domain_link = domain_cell.find('a')
-                            if domain_link:
-                                domain_name = domain_link.text.strip()
-                                if not tld or domain_name.endswith(f'.{tld}'):
+                data = resp.json()
+                for domain_info in data.get('domains', []):
+                    domain_name = domain_info.get('domain', '')
+                    if domain_name and '.' in domain_name:
+                        # Additional filtering for keyword and TLD
+                        if (not keyword or keyword.lower() in domain_name.lower()) and \
+                           (not tld or domain_name.endswith(f'.{tld}')):
+                            domains.append({
+                                'domain': domain_name,
+                                'status': 'expired' if domain_info.get('isDead') == 'True' else 'unknown',
+                                'source': 'DomainsDB',
+                                'created': domain_info.get('create_date', ''),
+                                'updated': domain_info.get('update_date', ''),
+                                'has_dns': bool(domain_info.get('A') or domain_info.get('NS'))
+                            })
+                            
+                            if len(domains) >= 10:
+                                break
+        except Exception as e:
+            # Continue with other methods if DomainsDB fails
+            pass
+        
+        # Method 2: Dynadot CSV - Pending delete domains with appraisal values
+        if len(domains) < 10:
+            try:
+                resp = await client.get(
+                    'https://www.dynadot.com/market/backorder/backorders.csv',
+                    headers={'User-Agent': 'Mozilla/5.0 (compatible; Domain-MCP/1.0)'}
+                )
+                if resp.status_code == 200:
+                    lines = resp.text.strip().split('\n')[1:]  # Skip header
+                    for line in lines:
+                        if line.strip():
+                            parts = [p.strip() for p in line.split(',')]
+                            if len(parts) >= 2:
+                                domain_name = parts[0].strip()
+                                if domain_name and '.' in domain_name:
+                                    # Filter by keyword and TLD
+                                    if (not keyword or keyword.lower() in domain_name.lower()) and \
+                                       (not tld or domain_name.endswith(f'.{tld}')):
+                                        domains.append({
+                                            'domain': domain_name,
+                                            'status': 'pending delete',
+                                            'source': 'Dynadot',
+                                            'end_time': parts[1] if len(parts) > 1 else '',
+                                            'appraisal': parts[3] if len(parts) > 3 else '',
+                                            'starting_price': parts[4] if len(parts) > 4 else ''
+                                        })
+                                        
+                                        if len(domains) >= 10:
+                                            break
+            except Exception as e:
+                # Continue if Dynadot fails
+                pass
+        
+        # Method 3: NameJet inventory files
+        if len(domains) < 10:
+            namejet_urls = [
+                'https://www.namejet.com/download/namejet_inventory.txt',
+                'https://www.namejet.com/download/namejet-inventory.csv'
+            ]
+            
+            for url in namejet_urls:
+                try:
+                    resp = await client.get(
+                        url,
+                        headers={'User-Agent': 'Mozilla/5.0 (compatible; Domain-MCP/1.0)'}
+                    )
+                    if resp.status_code == 200 and resp.text:
+                        lines = resp.text.strip().split('\n')
+                        for line in lines:
+                            if line.strip() and '.' in line:
+                                # Extract domain name (could be first column in CSV or whole line in TXT)
+                                domain_name = line.strip().split(',')[0].strip().strip('"')
+                                if domain_name and '.' in domain_name and not domain_name.startswith('#'):
+                                    # Filter by keyword and TLD
+                                    if (not keyword or keyword.lower() in domain_name.lower()) and \
+                                       (not tld or domain_name.endswith(f'.{tld}')):
+                                        domains.append({
+                                            'domain': domain_name,
+                                            'status': 'auction/pending',
+                                            'source': 'NameJet'
+                                        })
+                                        
+                                        if len(domains) >= 10:
+                                            break
+                        break  # Stop trying other NameJet URLs if one worked
+                except Exception:
+                    continue
+        
+        # Method 4: SnapNames CSV as fallback
+        if len(domains) < 10:
+            try:
+                resp = await client.get(
+                    'https://www.snapnames.com/file_dl.sn?file=deletinglist.csv',
+                    headers={'User-Agent': 'Mozilla/5.0 (compatible; Domain-MCP/1.0)'}
+                )
+                if resp.status_code == 200:
+                    lines = resp.text.strip().split('\n')[1:]  # Skip header
+                    for line in lines:
+                        if line.strip():
+                            parts = [p.strip().strip('"') for p in line.split(',')]
+                            if parts and '.' in parts[0]:
+                                domain_name = parts[0]
+                                # Filter by keyword and TLD
+                                if (not keyword or keyword.lower() in domain_name.lower()) and \
+                                   (not tld or domain_name.endswith(f'.{tld}')):
                                     domains.append({
                                         'domain': domain_name,
-                                        'status': 'expired/deleted',
-                                        'source': 'expireddomains.net'
+                                        'status': 'pending delete',
+                                        'source': 'SnapNames'
                                     })
-                return domains
-            return []
-        except Exception as e:
-            return [{"error": f"Search failed: {str(e)}"}]
+                                    
+                                    if len(domains) >= 10:
+                                        break
+            except Exception:
+                pass
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_domains = []
+    for domain_info in domains:
+        domain_name = domain_info.get('domain', '')
+        if domain_name and domain_name not in seen:
+            seen.add(domain_name)
+            unique_domains.append(domain_info)
+    
+    # Return results or error message if none found
+    if unique_domains:
+        return unique_domains[:10]
+    else:
+        return [{"error": "No expired domains found matching your criteria. Try different keywords or check back later."}]
 
 async def domain_age_check(domain: str) -> Dict[str, Any]:
     """Check domain age and basic info"""
@@ -194,7 +349,31 @@ async def domain_age_check(domain: str) -> Dict[str, Any]:
         if 'entities' in whois_data:
             for entity in whois_data['entities']:
                 if 'registrar' in entity.get('roles', []):
-                    result['registrar'] = entity.get('vcardArray', [['', [['', '', '', 'Unknown']]]])[1][0][3]
+                    # Parse vcard array properly to get registrar name
+                    vcard = entity.get('vcardArray', [])
+                    if len(vcard) > 1 and isinstance(vcard[1], list):
+                        for vcard_entry in vcard[1]:
+                            if isinstance(vcard_entry, list) and len(vcard_entry) >= 4:
+                                # Look for 'fn' (full name) field
+                                if vcard_entry[0] == 'fn':
+                                    result['registrar'] = vcard_entry[3]
+                                    break
+                    # Fallback: try to get organization name from publicIds
+                    if result['registrar'] == 'Unknown' and 'publicIds' in entity:
+                        for pub_id in entity['publicIds']:
+                            if pub_id.get('type') == 'IANA Registrar ID':
+                                # Use the registrar name from links or other sources
+                                break
+                    # Another fallback: check links for registrar website
+                    if result['registrar'] == 'Unknown' and 'links' in entity:
+                        for link in entity['links']:
+                            if 'href' in link and 'registrar' in link.get('rel', ''):
+                                # Extract domain from href as registrar identifier
+                                import re
+                                match = re.search(r'//([^/]+)', link['href'])
+                                if match:
+                                    result['registrar'] = match.group(1)
+                                    break
                     
         return result
     except Exception as e:
