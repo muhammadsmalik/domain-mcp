@@ -1,0 +1,12 @@
+{
+    "mcpServers": {
+        "domain-mcp": {
+            "command": "/Users/salmanmalik/Documents/aimax/domain-mcp/.venv/bin/python",
+            "args": [
+                "/Users/salmanmalik/Documents/aimax/domain-mcp/main.py",
+                "--transport",
+                "stdio"
+            ]
+        }
+    }
+}
